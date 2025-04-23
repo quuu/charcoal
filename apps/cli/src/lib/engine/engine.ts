@@ -26,6 +26,7 @@ import {
 import { validateOrFixParentBranchRevision } from './parse_branches_and_meta';
 import { TScopeSpec } from './scope_spec';
 import fjsh from 'fast-json-stable-hash';
+import { runGitCommand } from '../git/runner';
 
 export type TEngine = {
   debug: string;
@@ -83,6 +84,10 @@ export type TEngine = {
   getParentPrecondition: (branchName: string) => string;
 
   getRelativeStack: (branchName: string, scope: TScopeSpec) => string[];
+
+  move: (args: { sourceBranch: string; targetBranch: string }) => {
+    result: 'MOVE_DONE' | 'MOVE_CONFLICT';
+  };
 
   checkoutNewBranch: (branchName: string) => void;
   checkoutBranch: (branchName: string) => void;
@@ -852,6 +857,66 @@ export function composeEngine({
       }
       handleSuccessfulRebase(branchName, newBase);
       return { result: 'REBASE_DONE' };
+    },
+    move: (args: { sourceBranch: string; targetBranch: string }) => {
+      const { sourceBranch, targetBranch } = args;
+      assertBranch(sourceBranch);
+      assertBranch(targetBranch);
+
+      // Check that target is not a descendant of source to avoid cycles
+      if (isDescendantOf(targetBranch, sourceBranch)) {
+        throw new PreconditionsFailedError(
+          `Cannot move ${chalk.yellow(sourceBranch)} onto ${chalk.yellow(
+            targetBranch
+          )} because it would create a cycle!`
+        );
+      }
+
+      const sourceMetadata =
+        assertBranchIsValidAndNotTrunkAndGetMeta(sourceBranch);
+      const originalParent = sourceMetadata.parentBranchName;
+      const targetMetadata = assertBranchIsValidOrTrunkAndGetMeta(targetBranch);
+
+      // Update parent in metadata
+      setParent(sourceBranch, targetBranch);
+
+      // Rebase the branch onto the new parent, with conflicts resolved in favor of source
+      const newBase = targetMetadata.branchRevision;
+
+      // We need to modify the git command to use -X ours to resolve conflicts in favor of source branch
+      try {
+        runGitCommand({
+          args: [
+            'rebase',
+            ...(restackCommitterDateIsAuthorDate
+              ? ['--committer-date-is-author-date']
+              : []),
+            '--onto',
+            targetBranch,
+            '-X',
+            'ours', // Resolve conflicts in favor of source branch
+            sourceMetadata.parentBranchRevision,
+            sourceBranch,
+          ],
+          options: { stdio: 'pipe' },
+          onError: 'throw',
+          resource: 'move',
+        });
+
+        // Update the branch revision after successful rebase
+        handleSuccessfulRebase(sourceBranch, newBase);
+
+        // Make sure we return to the original branch if we were on it
+        if (cache.currentBranch && cache.currentBranch in cache.branches) {
+          git.switchBranch(cache.currentBranch);
+        }
+
+        return { result: 'MOVE_DONE' };
+      } catch (e) {
+        // If conflicts couldn't be auto-resolved, revert the parent change
+        setParent(sourceBranch, originalParent);
+        return { result: 'MOVE_CONFLICT' };
+      }
     },
     rebaseInteractive: (branchName: string) => {
       const cachedMeta = assertBranchIsValidAndNotTrunkAndGetMeta(branchName);
